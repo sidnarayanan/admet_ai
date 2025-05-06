@@ -1,6 +1,6 @@
 """ADMET-AI class to contain ADMET model and prediction function."""
+
 from collections import defaultdict
-from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +21,6 @@ from chemprop.utils import load_args, load_checkpoint, load_scalers
 from rdkit import Chem
 from scipy.stats import percentileofscore
 from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
 
 from admet_ai.constants import (
     DEFAULT_DRUGBANK_PATH,
@@ -41,9 +40,7 @@ class ADMETModel:
         include_physchem: bool = True,
         drugbank_path: Path | str | None = DEFAULT_DRUGBANK_PATH,
         atc_code: str | None = None,
-        num_workers: int | None = None,
-        cache_molecules: bool = True,
-        fingerprint_multiprocessing_min: int = 100,
+        cache_molecules: bool = False,
     ) -> None:
         """Initialize the ADMET-AI model.
 
@@ -54,12 +51,7 @@ class ADMETModel:
                               with ADMET predictions and ATC codes.
         :param atc_code: The ATC code to filter the DrugBank reference set by.
                          If None, the entire DrugBank reference set will be used.
-        :param num_workers: Number of workers for the data loader. Zero workers (i.e., sequential data loading)
-                            may be faster if not using a GPU, while multiple workers (e.g., 8) are faster with a GPU.
-                            If None, defaults to 0 if no GPU is available and 8 if a GPU is available.
         :param cache_molecules: Whether to cache molecules. Caching improves prediction speed but requires more memory.
-        :param fingerprint_multiprocessing_min: Minimum number of molecules for multiprocessing to be used for
-                                                fingerprint computation. Otherwise, single processing is used.
         """
         # Check parameters
         if atc_code is not None and drugbank_path is None:
@@ -67,15 +59,10 @@ class ADMETModel:
                 "DrugBank reference set must be provided to filter by ATC code."
             )
 
-        # Set default num_workers
-        if num_workers is None:
-            num_workers = 8 if torch.cuda.is_available() else 0
-
         # Save parameters
         self.include_physchem = include_physchem
-        self.num_workers = num_workers
+        self.num_workers = 0
         self.cache_molecules = cache_molecules
-        self.fingerprint_multiprocessing_min = fingerprint_multiprocessing_min
         self._atc_code = atc_code
 
         # Load DrugBank reference set if needed
@@ -86,7 +73,9 @@ class ADMETModel:
             # Map ATC codes to all indices of the drugbank with that ATC code
             atc_code_to_drugbank_indices = defaultdict(set)
             for atc_column in [
-                column for column in self.drugbank.columns if column.startswith(DRUGBANK_ATC_NAME_PREFIX)
+                column
+                for column in self.drugbank.columns
+                if column.startswith(DRUGBANK_ATC_NAME_PREFIX)
             ]:
                 for index, atc_codes in self.drugbank[atc_column].dropna().items():
                     for atc_code in atc_codes.split(DRUGBANK_DELIMITER):
@@ -112,10 +101,8 @@ class ADMETModel:
         set_cache_graph(self.cache_molecules)
         set_cache_mol(self.cache_molecules)
 
-        # Set device based on GPU availability
-        self.device = (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        )
+        # Only run on CPU
+        self.device = torch.device("cpu")
 
         # Prepare lists to contain model details
         self.task_lists: list[list[str]] = []
@@ -216,7 +203,7 @@ class ADMETModel:
 
         # Convert SMILES to RDKit molecules and cache if desired
         mols = []
-        for smile in tqdm(smiles, desc="SMILES to Mol"):
+        for smile in smiles:
             if smile in SMILES_TO_MOL:
                 mol = SMILES_TO_MOL[smile]
             else:
@@ -245,28 +232,8 @@ class ADMETModel:
 
         # Compute fingerprints if needed
         if self.use_features:
-            # Select between multiprocessing and single processing
-            if len(mols) >= self.fingerprint_multiprocessing_min:
-                pool = Pool()
-                map_fn = pool.imap
-            else:
-                pool = None
-                map_fn = map
-
             # Compute fingerprints
-            fingerprints = np.array(
-                list(
-                    tqdm(
-                        map_fn(compute_rdkit_fingerprint, mols),
-                        total=len(mols),
-                        desc=f"RDKit fingerprints",
-                    )
-                )
-            )
-
-            # Close pool if needed
-            if pool is not None:
-                pool.close()
+            fingerprints = np.array(list(map(compute_rdkit_fingerprint, mols)))
         else:
             fingerprints = [None] * len(smiles)
 
@@ -274,7 +241,10 @@ class ADMETModel:
         data_loader = MoleculeDataLoader(
             dataset=MoleculeDataset(
                 [
-                    MoleculeDatapoint(smiles=[smile], features=fingerprint,)
+                    MoleculeDatapoint(
+                        smiles=[smile],
+                        features=fingerprint,
+                    )
                     for smile, fingerprint in zip(smiles, fingerprints)
                 ]
             ),
@@ -286,21 +256,14 @@ class ADMETModel:
         task_to_preds = {}
 
         # Loop through each ensemble and make predictions
-        for tasks, use_features, models, scalers in tqdm(
-            zip(
-                self.task_lists,
-                self.use_features_list,
-                self.model_lists,
-                self.scaler_lists,
-            ),
-            total=self.num_ensembles,
-            desc="model ensembles",
+        for tasks, use_features, models, scalers in zip(
+            self.task_lists,
+            self.use_features_list,
+            self.model_lists,
+            self.scaler_lists,
         ):
             # Make predictions
-            preds = [
-                predict(model=model, data_loader=data_loader)
-                for model in tqdm(models, desc="individual models")
-            ]
+            preds = [predict(model=model, data_loader=data_loader) for model in models]
 
             # Scale predictions if needed (for regression)
             if scalers[0] is not None:
