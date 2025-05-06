@@ -1,4 +1,5 @@
 """Compute physicochemical properties using RDKit."""
+
 import pandas as pd
 from rdkit import Chem
 from rdkit.Chem.Crippen import MolLogP
@@ -10,7 +11,6 @@ from rdkit.Chem.rdMolDescriptors import (
     CalcNumHBD,
     CalcTPSA,
 )
-from tqdm import tqdm
 
 
 def lipinski_rule_of_five(mol: Chem.Mol) -> float:
@@ -65,7 +65,7 @@ def compute_physicochemical_properties(
                 property_name: property_function(mol)
                 for property_name, property_function in PHYSCHEM_PROPERTY_TO_FUNCTION.items()
             }
-            for mol in tqdm(mols, desc="Computing physchem properties")
+            for mol in mols
         ],
         index=all_smiles,
     )
